@@ -27,6 +27,11 @@ from AppKit import (
     NSWindowStyleMaskNonactivatingPanel,
 )
 from Foundation import NSMakeRect, NSObject
+from Quartz import (
+    CABasicAnimation,
+    CAMediaTimingFunction,
+    kCAMediaTimingFunctionEaseInEaseOut,
+)
 
 PILL_WIDTH = 380.0
 LABEL_X = 26.0
@@ -36,6 +41,8 @@ LINE_HEIGHT = 16.0  # one line of the 12 pt system font
 MAX_TEXT_HEIGHT = 7 * LINE_HEIGHT  # growth cap; beyond it the head is trimmed
 CORNER_MARGIN = 20.0  # inset from the lower-right corner of the visible screen
 CORNER_RADIUS = 15.0
+DOT_PULSE_PERIOD = 0.6  # seconds per fade half-cycle (full pulse = 2×)
+DOT_PULSE_MIN_ALPHA = 0.25  # dimmest point of the recording flicker
 
 
 class HudPanel(NSObject):
@@ -78,6 +85,7 @@ class HudPanel(NSObject):
         dot.setFrame_(NSMakeRect(12, V_PAD, 10, 14))
         dot.setFont_(NSFont.systemFontOfSize_(8))
         dot.setTextColor_(NSColor.systemRedColor())
+        dot.setWantsLayer_(True)  # layer needed for the opacity pulse animation
         content.addSubview_(dot)
 
         label = NSTextField.labelWithString_("")
@@ -101,6 +109,7 @@ class HudPanel(NSObject):
     def showText_(self, text):
         self._anchor_to_screen()
         self._dot.setTextColor_(NSColor.systemRedColor())
+        self._start_pulse()  # flicker like a mic recording indicator while listening
         self._layout(text)
         self._panel.orderFrontRegardless()
 
@@ -108,12 +117,37 @@ class HudPanel(NSObject):
         self._layout(text)
 
     def finalizeHud_(self, _):
+        self._stop_pulse()  # steady gray dot while the batch pass runs
         self._dot.setTextColor_(NSColor.systemGrayColor())
 
     def hideHud_(self, _):
+        self._stop_pulse()  # covers early-abort hides that skip finalize
         self._panel.orderOut_(None)
 
     # ---- helpers (plain Python, not exposed as selectors) ----
+
+    @objc.python_method
+    def _start_pulse(self):
+        """Pulse the dot's opacity so it flickers like a recording indicator.
+
+        Runs on Core Animation's render server (no main-thread/timer cost).
+        """
+        anim = CABasicAnimation.animationWithKeyPath_("opacity")
+        anim.setFromValue_(1.0)
+        anim.setToValue_(DOT_PULSE_MIN_ALPHA)
+        anim.setDuration_(DOT_PULSE_PERIOD)
+        anim.setAutoreverses_(True)
+        anim.setRepeatCount_(float("inf"))
+        anim.setTimingFunction_(
+            CAMediaTimingFunction.functionWithName_(kCAMediaTimingFunctionEaseInEaseOut)
+        )
+        self._dot.layer().addAnimation_forKey_(anim, "pulse")
+
+    @objc.python_method
+    def _stop_pulse(self):
+        layer = self._dot.layer()
+        layer.removeAnimationForKey_("pulse")
+        layer.setOpacity_(1.0)  # leave the dot solid once the flicker stops
 
     @objc.python_method
     def _layout(self, text):
