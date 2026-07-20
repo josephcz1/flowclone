@@ -63,7 +63,7 @@ class FlowCloneApp(rumps.App):
     def _load_model(self) -> None:
         from flowclone.stt import Transcriber
 
-        transcriber = Transcriber()
+        transcriber = Transcriber(quantization=config.load_model().quantization)
         transcriber.warmup()
         callAfter(self._model_ready, transcriber)
 
