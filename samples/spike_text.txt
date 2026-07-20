@@ -1,0 +1,1 @@
+Um, so basically I want to refactor the API endpoint in the repo, uh, so that Claude can, like, parse the JSON config faster. You know, the latency budget is around five hundred milliseconds. Actually, let me, uh, let me rephrase that. We should cache the parakeet model in memory, and stream partial transcripts to the HUD overlay while the hotkey is held.

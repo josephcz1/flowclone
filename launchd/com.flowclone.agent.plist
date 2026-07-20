@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Optional: start FlowClone's menu-bar app automatically at login.
+
+  Install:
+    cp launchd/com.flowclone.agent.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.flowclone.agent.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.flowclone.agent.plist
+    rm ~/Library/LaunchAgents/com.flowclone.agent.plist
+
+  IMPORTANT — permissions: macOS TCC grants attach to the *binary* that runs.
+  Launched by launchd (not Terminal.app), the daemon will ask for Microphone,
+  Input Monitoring and Accessibility again — this time for `uv`/python. Grant
+  them once when prompted (or in System Settings → Privacy & Security) and it
+  sticks. Until then the menu-bar icon appears but dictation/paste stay off.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.flowclone.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/josephchen/.local/bin/uv</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>/Users/josephchen/General/Projects/Whisprflow clone</string>
+        <string>flowclone</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/flowclone.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/flowclone.err.log</string>
+</dict>
+</plist>

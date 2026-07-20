@@ -1,0 +1,35 @@
+# FlowClone configuration. Edit and restart the daemon to apply.
+
+[cleanup]
+# Master switch for the filler-strip and stutter-dedupe passes. The personal
+# dictionary below still applies even when this is false.
+enabled = true
+
+# Collapse immediate word repeats: "the the API" -> "the API".
+dedupe_stutters = true
+
+# Append a trailing space so back-to-back dictations don't run together.
+add_trailing_space = false
+
+# Softer fillers to remove on top of the safe built-in set (um, uh, er, hmm…).
+# These CAN be meaningful words, so they're opt-in. Uncomment what you want gone:
+extra_fillers = [
+    # "like",
+    # "you know",
+    # "i mean",
+    # "basically",
+    # "actually",
+    # "sort of",
+    # "kind of",
+]
+
+# Built-in fillers you'd rather keep (e.g. "er" if you dictate British spellings).
+keep = []
+
+# Personal dictionary: words parakeet reliably mishears -> what you meant.
+# Case-insensitive, whole-word; multi-word keys take priority over single words.
+[dictionary]
+"cloud" = "Claude"
+"cloud code" = "Claude Code"
+"wispr" = "Wispr"
+"para keet" = "parakeet"
