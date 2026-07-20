@@ -1,5 +1,16 @@
 # FlowClone configuration. Edit and restart the daemon to apply.
 
+[model]
+# Weight precision for the speech model, trading resident RAM for accuracy.
+# (Attention layers stay full precision so the live-preview stream keeps working.)
+#   "8bit" (default) — ~896 MB, byte-for-byte identical output to full precision
+#                      on the benchmark clip, and slightly faster.
+#   "4bit"           — ~692 MB, same words with rare cosmetic punctuation drift.
+#   "none"           — ~1280 MB, full bf16 precision.
+# Re-benchmark your own audio with `uv run python scripts/bench_quant.py` before
+# trusting a lower setting on vocabulary the sample clip doesn't cover.
+quantization = "8bit"
+
 [cleanup]
 # Master switch for the filler-strip and stutter-dedupe passes. The personal
 # dictionary below still applies even when this is false.

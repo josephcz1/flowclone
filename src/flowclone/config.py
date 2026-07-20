@@ -28,6 +28,30 @@ DEFAULT_FILLERS: tuple[str, ...] = (
 )
 
 
+# Weight precision for the STT model. "8bit" is byte-for-byte identical to the
+# full "none" (bf16) output on our benchmark while cutting resident RAM ~39%;
+# "4bit" cuts ~60% with only cosmetic punctuation drift. See scripts/bench_quant.py.
+VALID_QUANTIZATION: tuple[str, ...] = ("none", "8bit", "4bit")
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    quantization: str = "8bit"
+
+
+def load_model(path: Path = CONFIG_PATH) -> ModelConfig:
+    """Read [model].quantization, falling back to the 8-bit default on any error."""
+    try:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except (FileNotFoundError, tomllib.TOMLDecodeError, TypeError, ValueError):
+        return ModelConfig()
+    quant = str(raw.get("model", {}).get("quantization", "8bit")).lower()
+    if quant not in VALID_QUANTIZATION:
+        quant = "8bit"
+    return ModelConfig(quantization=quant)
+
+
 @dataclass(frozen=True)
 class CleanupConfig:
     enabled: bool = True

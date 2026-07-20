@@ -74,6 +74,14 @@ class DictationSession(threading.Thread):
             print(f"\n  mic error: {exc}", file=sys.stderr)
             return
         mic_open_ms = (time.perf_counter() - t_press) * 1000
+        try:
+            self._record_and_transcribe(mic, mic_open_ms)
+        finally:
+            # Reclaim MLX's ~1.1 GB buffer pool now that the paste has landed;
+            # runs on every exit (finalized, canceled, or too-short).
+            self.transcriber.release_cache()
+
+    def _record_and_transcribe(self, mic, mic_open_ms: float) -> None:
         self.on_state("recording")
         if self.hud:
             self.hud.show("listening…")
@@ -162,9 +170,10 @@ class DictationSession(threading.Thread):
 
 
 def _load_transcriber() -> Transcriber:
-    print("loading model…", flush=True)
+    quantization = config.load_model().quantization
+    print(f"loading model… (quantization: {quantization})", flush=True)
     t0 = time.perf_counter()
-    transcriber = Transcriber()
+    transcriber = Transcriber(quantization=quantization)
     transcriber.warmup()
     print(f"model ready in {time.perf_counter() - t0:.1f}s (warm)")
     return transcriber
