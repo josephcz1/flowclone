@@ -3,7 +3,9 @@
 A borderless, non-activating NSPanel anchored to the lower-right corner. Text
 wraps at a fixed width and the panel grows UPWARD (bottom edge stays put) as
 the transcript lengthens; past ~7 lines the oldest words are trimmed with an
-ellipsis so the newest speech is always visible. It never takes focus and
+ellipsis so the newest speech is always visible. A red dot beside the newest
+line pulses while the mic is live and goes solid gray while the accurate batch
+pass runs, so recording state is readable at a glance. It never takes focus and
 ignores the mouse, so the target app keeps keyboard focus. All AppKit calls
 happen on the main thread; worker threads must use the thread-safe
 show/update/finalize/hide wrappers.
@@ -20,6 +22,7 @@ from AppKit import (
     NSScreen,
     NSStatusWindowLevel,
     NSTextField,
+    NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowCollectionBehaviorStationary,
@@ -41,8 +44,12 @@ LINE_HEIGHT = 16.0  # one line of the 12 pt system font
 MAX_TEXT_HEIGHT = 7 * LINE_HEIGHT  # growth cap; beyond it the head is trimmed
 CORNER_MARGIN = 20.0  # inset from the lower-right corner of the visible screen
 CORNER_RADIUS = 15.0
-DOT_PULSE_PERIOD = 0.6  # seconds per fade half-cycle (full pulse = 2×)
-DOT_PULSE_MIN_ALPHA = 0.25  # dimmest point of the recording flicker
+DOT_SIZE = 8.0
+DOT_X = 13.0
+DOT_Y = V_PAD + 3.0  # vertically centred on the first (bottom) line of text
+PULSE_KEY = "flowclone.pulse"
+PULSE_PERIOD = 0.6  # seconds per half-cycle; autoreversed, so 1.2 s round trip
+PULSE_MIN_OPACITY = 0.25
 
 
 class HudPanel(NSObject):
@@ -81,11 +88,15 @@ class HudPanel(NSObject):
 
         # The dot sits at the fixed bottom-left, beside the newest line of text
         # (text wraps top-down, so the latest words are always at the bottom).
-        dot = NSTextField.labelWithString_("●")
-        dot.setFrame_(NSMakeRect(12, V_PAD, 10, 14))
-        dot.setFont_(NSFont.systemFontOfSize_(8))
-        dot.setTextColor_(NSColor.systemRedColor())
-        dot.setWantsLayer_(True)  # layer needed for the opacity pulse animation
+        # A layer-backed view rather than a glyph, so Core Animation can pulse
+        # its opacity on the window server without any Python-side timer.
+        dot = NSView.alloc().initWithFrame_(
+            NSMakeRect(DOT_X, DOT_Y, DOT_SIZE, DOT_SIZE)
+        )
+        dot.setWantsLayer_(True)
+        dot_layer = dot.layer()
+        dot_layer.setCornerRadius_(DOT_SIZE / 2)
+        dot_layer.setBackgroundColor_(NSColor.systemRedColor().CGColor())
         content.addSubview_(dot)
 
         label = NSTextField.labelWithString_("")
@@ -108,46 +119,48 @@ class HudPanel(NSObject):
 
     def showText_(self, text):
         self._anchor_to_screen()
-        self._dot.setTextColor_(NSColor.systemRedColor())
-        self._start_pulse()  # flicker like a mic recording indicator while listening
+        self._dot.layer().setBackgroundColor_(NSColor.systemRedColor().CGColor())
         self._layout(text)
         self._panel.orderFrontRegardless()
+        # Started after the panel is on screen: Core Animation suspends layer
+        # animations for off-screen windows, and one attached earlier would come
+        # back mid-cycle rather than from full opacity.
+        self._start_pulse()
 
     def updateText_(self, text):
         self._layout(text)
 
     def finalizeHud_(self, _):
-        self._stop_pulse()  # steady gray dot while the batch pass runs
-        self._dot.setTextColor_(NSColor.systemGrayColor())
+        self._stop_pulse()
+        self._dot.layer().setBackgroundColor_(NSColor.systemGrayColor().CGColor())
 
     def hideHud_(self, _):
-        self._stop_pulse()  # covers early-abort hides that skip finalize
+        self._stop_pulse()
         self._panel.orderOut_(None)
 
     # ---- helpers (plain Python, not exposed as selectors) ----
 
     @objc.python_method
     def _start_pulse(self):
-        """Pulse the dot's opacity so it flickers like a recording indicator.
-
-        Runs on Core Animation's render server (no main-thread/timer cost).
-        """
+        """Breathe the dot's opacity while recording, forever until stopped."""
+        layer = self._dot.layer()
+        layer.removeAnimationForKey_(PULSE_KEY)
         anim = CABasicAnimation.animationWithKeyPath_("opacity")
         anim.setFromValue_(1.0)
-        anim.setToValue_(DOT_PULSE_MIN_ALPHA)
-        anim.setDuration_(DOT_PULSE_PERIOD)
+        anim.setToValue_(PULSE_MIN_OPACITY)
+        anim.setDuration_(PULSE_PERIOD)
         anim.setAutoreverses_(True)
         anim.setRepeatCount_(float("inf"))
         anim.setTimingFunction_(
             CAMediaTimingFunction.functionWithName_(kCAMediaTimingFunctionEaseInEaseOut)
         )
-        self._dot.layer().addAnimation_forKey_(anim, "pulse")
+        layer.addAnimation_forKey_(anim, PULSE_KEY)
 
     @objc.python_method
     def _stop_pulse(self):
-        layer = self._dot.layer()
-        layer.removeAnimationForKey_("pulse")
-        layer.setOpacity_(1.0)  # leave the dot solid once the flicker stops
+        # Removing the animation snaps the layer back to its model opacity (1.0),
+        # so the gray finalizing dot is always fully solid.
+        self._dot.layer().removeAnimationForKey_(PULSE_KEY)
 
     @objc.python_method
     def _layout(self, text):
