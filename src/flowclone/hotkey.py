@@ -1,11 +1,19 @@
 """Global hold-to-talk hotkey: listen-only Quartz event tap on Right ⌘.
 
+The tap is already watching every key and click to tell a dictation apart from a
+⌘-shortcut, so it is also the cheapest possible place to notice that the caret
+has moved: any real press clears context's memory of what it last pasted. That
+is a direct call rather than another callback because it must happen no matter
+which frontend built the tap, and a frontend that forgot to wire it would
+silently paste against a stale caret.
+
 Requires Input Monitoring permission for the hosting terminal app
 (System Settings → Privacy & Security → Input Monitoring).
 """
 
 import Quartz
 
+from flowclone import context
 from flowclone.inject import SYNTHETIC_MARK
 
 RIGHT_CMD_KEYCODE = 54
@@ -31,8 +39,13 @@ class HoldToTalk:
 
     def install(self) -> None:
         """Create the tap and attach it to the CURRENT thread's run loop."""
-        mask = Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) | Quartz.CGEventMaskBit(
-            Quartz.kCGEventKeyDown
+        # Mouse-down is here only to invalidate the caret memory: clicking is the
+        # one way to move the caret that produces no keystroke.
+        mask = (
+            Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseDown)
         )
         self._tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
@@ -81,12 +94,18 @@ class HoldToTalk:
                     if not self._canceled:
                         self._on_release()
                     self._canceled = False
-        elif type_ == Quartz.kCGEventKeyDown and self._held and not self._canceled:
+        elif type_ == Quartz.kCGEventKeyDown:
             if (
                 Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
                 == SYNTHETIC_MARK
             ):
                 return event  # our own paste event, not the user typing
-            self._canceled = True
-            self._on_cancel()
+            # A real keystroke, held or not: the caret is no longer where we
+            # left it, so what we pasted last says nothing about it now.
+            context.invalidate()
+            if self._held and not self._canceled:
+                self._canceled = True
+                self._on_cancel()
+        elif type_ in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventRightMouseDown):
+            context.invalidate()
         return event

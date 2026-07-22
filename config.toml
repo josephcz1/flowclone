@@ -19,7 +19,16 @@ enabled = true
 # Collapse immediate word repeats: "the the API" -> "the API".
 dedupe_stutters = true
 
-# Append a trailing space so back-to-back dictations don't run together.
+# Read the text before your cursor (Accessibility) and join onto it properly:
+# a leading space when one is missing, and lowercase when you paused mid-
+# sentence. Costs ~1ms, taken while you are still speaking. Apps that refuse to
+# expose their caret (WezTerm, Obsidian, Electron apps) simply get the old
+# behavior. Diagnose any app with: python scripts/ax_probe.py
+context_aware = true
+
+# Append a trailing space so back-to-back dictations don't run together. Largely
+# superseded by context_aware, and unreliable anyway — Slack and some web fields
+# strip a trailing space on paste.
 add_trailing_space = false
 
 # Softer fillers to remove on top of the safe built-in set (um, uh, er, hmm…).
