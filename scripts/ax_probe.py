@@ -5,8 +5,7 @@ a real machine can answer: does the macOS Accessibility API expose the caret and
 surrounding text in the apps Joseph actually dictates into? Terminals, Electron
 and canvas editors are the known-doubtful cases.
 
-    uv run --with pyobjc-framework-applicationservices \
-        python scripts/ax_probe.py
+    uv run python scripts/ax_probe.py
 
 Needs Accessibility permission for the *hosting terminal app* (System Settings →
 Privacy & Security → Accessibility) — the same grant the daemon already needs to
@@ -14,8 +13,9 @@ post ⌘V.
 
 Three strategies are tried per sample, because no single one covers the field:
 
-  1. system-wide  — AXUIElementCreateSystemWide → kAXFocusedUIElement. Cheapest,
-                    and what production should try first.
+  1. system-wide  — AXUIElementCreateSystemWide → kAXFocusedUIElement. The
+                    cheapest ask, but not the one production leads with; see
+                    flowclone.context._focused_element for why.
   2. by-pid       — AXUIElementCreateApplication(frontmost pid) → same attribute.
                     Sometimes answers when the system-wide element won't.
   3. manual-ax    — set the undocumented-but-universal AXManualAccessibility flag

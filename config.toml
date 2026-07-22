@@ -23,7 +23,7 @@ dedupe_stutters = true
 # a leading space when one is missing, and lowercase when you paused mid-
 # sentence. Costs ~1ms, taken while you are still speaking. Apps that refuse to
 # expose their caret (WezTerm, Obsidian, Electron apps) simply get the old
-# behavior. Diagnose any app with: python scripts/ax_probe.py
+# behavior. Diagnose any app with: uv run python scripts/ax_probe.py
 context_aware = true
 
 # Append a trailing space so back-to-back dictations don't run together. Largely

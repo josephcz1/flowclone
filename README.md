@@ -29,7 +29,8 @@ System Settings → Privacy & Security →
 
 - **Microphone** — to record.
 - **Input Monitoring** — to detect the Right ⌘ hold.
-- **Accessibility** — to paste (synthetic ⌘V).
+- **Accessibility** — to paste (synthetic ⌘V) and to read the text before the
+  caret for context-aware joins.
 
 Grants attach to the launching binary, so if you later autostart via launchd
 you'll re-grant them for `uv`/python once (see
@@ -38,20 +39,23 @@ you'll re-grant them for `uv`/python once (see
 ## Cleanup & personal dictionary (`config.toml`)
 
 The committed text (not the live preview) runs through a zero-latency cleanup
-pass before pasting: personal-dictionary fixes, filler-word removal, and
-stutter dedupe. Edit [config.toml](config.toml) and restart to tune it:
+pass before pasting: personal-dictionary fixes, filler-word removal, stutter
+dedupe, and a context-aware join that adds the missing space between
+back-to-back dictations and lowercases mid-sentence continuations. Edit
+[config.toml](config.toml) and restart to tune it:
 
 - `[dictionary]` — words parakeet mishears → what you meant
   (ships with `cloud → Claude`, `cloud code → Claude Code`).
 - `[cleanup].extra_fillers` — opt in to removing softer fillers
   (`like`, `you know`, `basically`, …). The built-in set (um, uh, er, hmm…) is
   always safe to strip.
-- `[cleanup].add_trailing_space`, `dedupe_stutters`, `enabled` — toggles.
+- `[cleanup].context_aware`, `add_trailing_space`, `dedupe_stutters`,
+  `enabled` — toggles, each explained by its comment in the file.
 
 ## Develop
 
 ```sh
-uv run --with pytest pytest   # cleanup-engine unit tests
+uv run --with pytest pytest   # unit tests: cleanup, context joins, hotkey tap
 uv run python scripts/qa_check.py   # end-to-end subsystem checks
 uvx ruff check src tests
 ```
