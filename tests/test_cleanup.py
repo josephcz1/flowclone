@@ -5,6 +5,7 @@ Run: uv run pytest
 
 from flowclone.cleanup import clean
 from flowclone.config import CleanupConfig, load
+from flowclone.context import Join, decide
 
 DICT = (
     ("cloud code", "Claude Code"),
@@ -73,6 +74,51 @@ def test_extra_fillers_opt_in():
 def test_rambling_fixture():
     raw = "Um, so I I want to, uh, ask cloud to, um, parse the the JSON."
     assert clean(raw, CFG) == "So I want to, ask Claude to, parse the JSON."
+
+
+def test_join_none_preserves_historical_behavior():
+    # Every pre-existing test above passes join=None implicitly; make the
+    # guarantee explicit so a future refactor can't quietly change it.
+    assert clean("um, so it works", CFG, None) == "So it works"
+
+
+def test_join_prepends_space_and_keeps_capital_after_a_period():
+    join = decide("I am going to the store.")
+    assert clean("Then I came back.", CFG, join) == " Then I came back."
+
+
+def test_join_lowercases_a_mid_sentence_continuation():
+    join = decide("I went to the")
+    assert clean("Store yesterday.", CFG, join) == " store yesterday."
+
+
+def test_join_adds_no_space_when_one_is_already_there():
+    join = decide("I went to the ")
+    assert clean("Store yesterday.", CFG, join) == "store yesterday."
+
+
+def test_join_lowercase_survives_a_stripped_leading_filler():
+    # The filler strip re-exposes "want" as the first word; it must end up
+    # lowercase because the caret is mid-sentence, not capitalized by _tidy.
+    join = decide("I really")
+    assert clean("Um, want to refactor", CFG, join) == " want to refactor"
+
+
+def test_join_never_emits_a_lone_space_for_an_empty_transcript():
+    assert clean("", CFG, Join(space=True, capitalize=True)) == ""
+    assert clean("   ", CFG, Join(space=True, capitalize=True)) == ""
+
+
+def test_join_composes_with_trailing_space_option():
+    cfg = CleanupConfig(dictionary=DICT, add_trailing_space=True)
+    assert clean("done", cfg, Join(space=True, capitalize=True)) == " Done "
+
+
+def test_join_applies_after_the_dictionary():
+    # A dictionary replacement lands at the start; the mid-sentence rule must
+    # still lowercase it rather than the dictionary's capital winning.
+    join = decide("I opened")
+    assert clean("cloud and asked", CFG, join) == " claude and asked"
 
 
 def test_default_config_loads():

@@ -7,7 +7,8 @@ Runs on the batch-accurate text before it is pasted. Four passes, in order:
   2. filler strip         — drop "um"/"uh"/… (see config.DEFAULT_FILLERS).
   3. stutter dedupe       — collapse immediate word repeats ("the the" -> "the").
   4. tidy                 — repair the whitespace/punctuation the strips leave
-                            behind and restore leading capitalization.
+                            behind, and set leading capitalization to match the
+                            text already at the caret (see flowclone.context).
 
 The live HUD keeps showing the raw streaming partials; cleanup only shapes the
 committed text — the same split Wispr Flow makes. Everything here is regex on a
@@ -47,22 +48,31 @@ def _strip_fillers(text: str, fillers) -> str:
     return filler_re.sub("", text)
 
 
-def _tidy(text: str) -> str:
+def _tidy(text: str, capitalize: bool = True) -> str:
     text = _REPEAT_PUNCT.sub(r"\1", text)
     text = _SPACE_BEFORE_PUNCT.sub(r"\1", text)
     text = _MULTISPACE.sub(" ", text)
     # Leading junk left by a stripped opening filler ("  , so" -> "so").
     text = re.sub(r"^[\s,]+", "", text)
     text = text.strip()
+    if not text:
+        return text
     # Removing a leading "Um," can leave the next word lowercased — recapitalize.
-    if text and text[0].islower():
-        text = text[0].upper() + text[1:]
-    return text
+    # But when the caret sits mid-sentence, the capital is this function's own
+    # artifact rather than the speaker's, so context.decide asks us to drop it.
+    if capitalize:
+        return text[0].upper() + text[1:] if text[0].islower() else text
+    return text[0].lower() + text[1:] if text[0].isupper() else text
 
 
-def clean(text: str, cfg: CleanupConfig) -> str:
+def clean(text: str, cfg: CleanupConfig, join=None) -> str:
     """Return the cleaned transcript. Dictionary always applies; the filler and
-    stutter passes are skipped when cleanup is disabled."""
+    stutter passes are skipped when cleanup is disabled.
+
+    `join` is a context.Join describing the text already before the caret, or
+    None when the focused app wouldn't tell us. None preserves the historical
+    behavior exactly: always capitalize, never prepend.
+    """
     if not text:
         return text
     text = _apply_dictionary(text, cfg.dictionary)
@@ -70,7 +80,10 @@ def clean(text: str, cfg: CleanupConfig) -> str:
         text = _strip_fillers(text, cfg.fillers)
         if cfg.dedupe_stutters:
             text = _STUTTER.sub(r"\1", text)
-    text = _tidy(text)
+    text = _tidy(text, capitalize=join.capitalize if join else True)
+    # After _tidy, which strips: a leading space it would have eaten.
+    if join is not None and join.space and text:
+        text = " " + text
     if cfg.add_trailing_space and text:
         text += " "
     return text

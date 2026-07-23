@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 
-from flowclone import cleanup, config, inject
+from flowclone import cleanup, config, context, inject
 from flowclone.audio import SAMPLE_RATE, MicRecorder
 from flowclone.stt import Transcriber, to_mx
 
@@ -56,6 +56,12 @@ class DictationSession(threading.Thread):
         self.stop_event = threading.Event()
         self.canceled = False
         self.t_release: float | None = None
+        # Text before the caret, sampled once at the top of the recording. None
+        # means the focused app wouldn't tell us.
+        self.before_caret: str | None = None
+        self.ctx_source = "blind"
+        self.app_id: str | None = None
+        self.ctx_ms = 0.0
 
     def release(self) -> None:
         self.t_release = time.perf_counter()
@@ -86,6 +92,22 @@ class DictationSession(threading.Thread):
         if self.hud:
             self.hud.show("listening…")
         _live_line("listening…")
+
+        # Sample the caret now, not at paste time. You are about to speak for a
+        # second or more, so the read is free here, and re-deriving it every
+        # recording means there is no cached "where was the cursor" state to
+        # invalidate when you switch apps or click elsewhere.
+        if self.cleanup_cfg.context_aware:
+            t_ctx = time.perf_counter()
+            self.app_id = context.frontmost_app_id()
+            # Our own last paste first: it costs nothing and, unlike AX, it can
+            # answer inside Electron apps and terminals.
+            self.before_caret = context.recall(self.app_id)
+            self.ctx_source = "self"
+            if self.before_caret is None:
+                self.before_caret = context.read_before_caret()
+                self.ctx_source = "ax" if self.before_caret is not None else "blind"
+            self.ctx_ms = (time.perf_counter() - t_ctx) * 1000
 
         blocks: list[np.ndarray] = []
         pending: list[np.ndarray] = []
@@ -143,7 +165,8 @@ class DictationSession(threading.Thread):
             self.hud.finalize()  # gray dot while the accurate batch pass runs
         t0 = time.perf_counter()
         text = self.transcriber.batch_text(to_mx(audio)).strip()
-        text = cleanup.clean(text, self.cleanup_cfg)
+        join = context.decide(self.before_caret) if self.before_caret is not None else None
+        text = cleanup.clean(text, self.cleanup_cfg, join)
         batch_ms = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
@@ -153,6 +176,9 @@ class DictationSession(threading.Thread):
             paste_note = "NOT pasted — grant Accessibility"
         elif inject.paste_text(text):
             paste_note = "pasted"
+            # The caret is now sitting at the end of this. It stays true until
+            # the event tap sees a key or a click.
+            context.remember(text, context.frontmost_app_id())
         else:
             paste_note = "NOT pasted — secure input field"
         paste_ms = (time.perf_counter() - t0) * 1000
@@ -162,6 +188,16 @@ class DictationSession(threading.Thread):
         if self.hud:
             self.hud.hide()
         print(f"» {text}")
+        if self.cleanup_cfg.context_aware:
+            if join is None:
+                detail = "blind (no prior paste, and no caret from the app)"
+            else:
+                detail = (
+                    f"{self.ctx_source} {self.before_caret[-32:]!r} → "
+                    f"{'space + ' if join.space else 'no space, '}"
+                    f"{'Capital' if join.capitalize else 'lowercase'}"
+                )
+            print(f"  [context {self.ctx_ms:.0f}ms: {detail}]")
         print(
             f"  [{duration:.1f}s audio · mic open {mic_open_ms:.0f}ms · "
             f"{n_partials} partials · finalize {batch_ms:.0f}ms · "

@@ -57,6 +57,10 @@ class CleanupConfig:
     enabled: bool = True
     dedupe_stutters: bool = True
     add_trailing_space: bool = False
+    # Read the text before the caret (Accessibility) to decide whether to
+    # prepend a space and whether to capitalize. Silently inert in apps that
+    # won't answer — see flowclone.context.
+    context_aware: bool = True
     fillers: tuple[str, ...] = DEFAULT_FILLERS
     # (spoken, replacement) pairs, sorted longest-first so multi-word entries
     # ("cloud code" -> "Claude Code") win over the single-word rule.
@@ -81,6 +85,7 @@ def _coerce(raw: dict) -> CleanupConfig:
         enabled=bool(cleanup.get("enabled", True)),
         dedupe_stutters=bool(cleanup.get("dedupe_stutters", True)),
         add_trailing_space=bool(cleanup.get("add_trailing_space", False)),
+        context_aware=bool(cleanup.get("context_aware", True)),
         fillers=fillers,
         dictionary=tuple(pairs),
     )
