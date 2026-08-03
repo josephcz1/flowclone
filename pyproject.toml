@@ -8,6 +8,7 @@ dependencies = [
     "pyobjc-framework-quartz>=12.2.1",
     "rumps>=0.4.0",
     "sounddevice>=0.5.5",
+    "tomlkit>=0.13.3",
 ]
 
 [project.scripts]

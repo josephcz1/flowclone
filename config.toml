@@ -11,6 +11,14 @@
 # trusting a lower setting on vocabulary the sample clip doesn't cover.
 quantization = "8bit"
 
+[handsfree]
+# Holding Right ⌘ is always push-to-talk. With this enabled, a QUICK TAP
+# (< 0.35s) locks the mic on hands-free instead: finish by tapping again, or
+# just stop talking — after silence_stop_seconds of quiet the dictation
+# finalizes and pastes on its own. Tapping without speaking self-cancels.
+enabled = true
+silence_stop_seconds = 1.5
+
 [cleanup]
 # Master switch for the filler-strip and stutter-dedupe passes. The personal
 # dictionary below still applies even when this is false.
@@ -25,6 +33,11 @@ dedupe_stutters = true
 # expose their caret (WezTerm, Obsidian, Electron apps) simply get the old
 # behavior. Diagnose any app with: uv run python scripts/ax_probe.py
 context_aware = true
+
+# Dictating just "scratch that" (or "delete that") deletes the previous
+# dictation instead of pasting, provided nothing was typed or clicked since it
+# landed. Strictly the whole utterance: "scratch that idea" pastes normally.
+scratch_that = true
 
 # Append a trailing space so back-to-back dictations don't run together. Largely
 # superseded by context_aware, and unreliable anyway — Slack and some web fields

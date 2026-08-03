@@ -27,13 +27,16 @@ def imports():
     import flowclone.cleanup  # noqa: F401
     import flowclone.config  # noqa: F401
     import flowclone.hotkey  # noqa: F401
+    import flowclone.history  # noqa: F401
     import flowclone.hud  # noqa: F401
     import flowclone.inject  # noqa: F401
+    import flowclone.login  # noqa: F401
     import flowclone.main  # noqa: F401
     import flowclone.menubar  # noqa: F401
+    import flowclone.preferences  # noqa: F401
     import flowclone.stt  # noqa: F401
 
-    return "all nine modules"
+    return "all twelve modules"
 
 
 def cleanup_pipeline():

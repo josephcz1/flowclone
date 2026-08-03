@@ -20,6 +20,61 @@ RIGHT_CMD_KEYCODE = 54
 # NX_DEVICERCMDKEYMASK — device-specific flag bit that distinguishes the right
 # ⌘ key from the left one (kCGEventFlagMaskCommand covers both).
 RIGHT_CMD_DEVICE_MASK = 0x0010
+# How often the recovery timer checks that the tap is still alive (see below).
+RECOVER_INTERVAL_SECONDS = 2.0
+
+
+# Last flagsChanged seen by the NSEvent global monitor; None until the first
+# one arrives. AppKit's monitor is the witness the tap can't be: its native
+# side never lags (so macOS never kills it) and its events queue for the main
+# loop instead of dropping, so a release is at worst late, never lost.
+_monitor_down: bool | None = None
+
+
+def _monitor_saw_flags(event) -> None:
+    global _monitor_down
+    _monitor_down = bool(event.modifierFlags() & RIGHT_CMD_DEVICE_MASK)
+
+
+def right_cmd_sources() -> tuple[bool | None, bool | None, bool | None]:
+    """Each source's belief about whether Right ⌘ is held; None means blind.
+
+    The tap cannot be the only witness to the release: macOS silently disables
+    a tap whose callback responds too slowly, and streaming inference starves
+    the Python callback of the GIL for long enough to trigger exactly that — a
+    dropped release left the recording running forever. No single alternative
+    is trustworthy either (CGEventSourceKeyState turned out not to see modifier
+    keys at all), hence several, arbitrated by ReleaseWatchdog.
+    """
+    state = Quartz.kCGEventSourceStateCombinedSessionState
+    return (
+        bool(Quartz.CGEventSourceKeyState(state, RIGHT_CMD_KEYCODE)),
+        bool(Quartz.CGEventSourceFlagsState(state) & RIGHT_CMD_DEVICE_MASK),
+        _monitor_down,
+    )
+
+
+def right_cmd_is_down() -> bool:
+    return any(bool(s) for s in right_cmd_sources())
+
+
+class ReleaseWatchdog:
+    """Ends the hold when every source that has proven itself says 'up'.
+
+    A source proves itself by reporting 'down' during this hold; only proven
+    sources get a vote on the release. A source that is blind on this system
+    (permanently False/None) therefore can neither end a dictation early nor
+    keep one alive.
+    """
+
+    def __init__(self) -> None:
+        self._armed: set[int] = set()
+
+    def released(self, sources) -> bool:
+        for i, down in enumerate(sources):
+            if down:
+                self._armed.add(i)
+        return bool(self._armed) and not any(sources[i] for i in self._armed)
 
 
 class HoldToTalk:
@@ -36,6 +91,8 @@ class HoldToTalk:
         self._held = False
         self._canceled = False
         self._tap = None
+        self._recover_timer = None
+        self._flags_monitor = None
 
     def install(self) -> None:
         """Create the tap and attach it to the CURRENT thread's run loop."""
@@ -66,6 +123,40 @@ class HoldToTalk:
             Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes
         )
         Quartz.CGEventTapEnable(self._tap, True)
+        # A disabled-by-timeout tap normally re-enables itself from its own
+        # disable notification, but that notification is itself a starved
+        # callback — this timer is the recovery path that needs no events.
+        self._recover_timer = Quartz.CFRunLoopTimerCreate(
+            None,
+            Quartz.CFAbsoluteTimeGetCurrent() + RECOVER_INTERVAL_SECONDS,
+            RECOVER_INTERVAL_SECONDS,
+            0,
+            0,
+            lambda _timer, _info: self._recover(right_cmd_is_down()),
+            None,
+        )
+        Quartz.CFRunLoopAddTimer(
+            Quartz.CFRunLoopGetCurrent(), self._recover_timer, Quartz.kCFRunLoopCommonModes
+        )
+        from AppKit import NSEvent, NSEventMaskFlagsChanged
+
+        self._flags_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskFlagsChanged, _monitor_saw_flags
+        )
+
+    def _recover(self, key_down: bool) -> None:
+        """Undo what a dead tap left behind: re-enable it, resync `_held`.
+
+        A release missed by the tap leaves `_held` True, which would make the
+        NEXT press look like a continuation and get ignored. The session that
+        was recording has already ended itself via right_cmd_is_down, so no
+        callback fires here — this only restores the state machine.
+        """
+        if self._tap is not None and not Quartz.CGEventTapIsEnabled(self._tap):
+            Quartz.CGEventTapEnable(self._tap, True)
+        if self._held and not key_down:
+            self._held = False
+            self._canceled = False
 
     def run_forever(self) -> None:
         self.install()
