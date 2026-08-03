@@ -9,6 +9,8 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+import tomlkit
+
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.toml"
 
 # Conservative by design: only sounds that are never meaningful words. Softer
@@ -53,6 +55,33 @@ def load_model(path: Path = CONFIG_PATH) -> ModelConfig:
 
 
 @dataclass(frozen=True)
+class HandsFreeConfig:
+    # Quick-tap Right ⌘ to lock the mic on; stop by tapping again or by
+    # falling silent for silence_stop_seconds. Holding is always push-to-talk.
+    enabled: bool = True
+    silence_stop_seconds: float = 1.5
+
+
+def load_handsfree(path: Path = CONFIG_PATH) -> HandsFreeConfig:
+    """Read [handsfree], falling back to defaults on any error."""
+    try:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except (FileNotFoundError, tomllib.TOMLDecodeError, TypeError, ValueError):
+        return HandsFreeConfig()
+    section = raw.get("handsfree", {})
+    try:
+        seconds = float(section.get("silence_stop_seconds", 1.5))
+    except (TypeError, ValueError):
+        seconds = 1.5
+    seconds = min(10.0, max(0.5, seconds))
+    return HandsFreeConfig(
+        enabled=bool(section.get("enabled", True)),
+        silence_stop_seconds=seconds,
+    )
+
+
+@dataclass(frozen=True)
 class CleanupConfig:
     enabled: bool = True
     dedupe_stutters: bool = True
@@ -61,6 +90,9 @@ class CleanupConfig:
     # prepend a space and whether to capitalize. Silently inert in apps that
     # won't answer — see flowclone.context.
     context_aware: bool = True
+    # Saying just "scratch that" deletes the previous dictation instead of
+    # pasting the words "scratch that" — see cleanup.is_scratch_command.
+    scratch_that: bool = True
     fillers: tuple[str, ...] = DEFAULT_FILLERS
     # (spoken, replacement) pairs, sorted longest-first so multi-word entries
     # ("cloud code" -> "Claude Code") win over the single-word rule.
@@ -86,6 +118,7 @@ def _coerce(raw: dict) -> CleanupConfig:
         dedupe_stutters=bool(cleanup.get("dedupe_stutters", True)),
         add_trailing_space=bool(cleanup.get("add_trailing_space", False)),
         context_aware=bool(cleanup.get("context_aware", True)),
+        scratch_that=bool(cleanup.get("scratch_that", True)),
         fillers=fillers,
         dictionary=tuple(pairs),
     )
@@ -98,3 +131,91 @@ def load(path: Path = CONFIG_PATH) -> CleanupConfig:
             return _coerce(tomllib.load(fh))
     except (FileNotFoundError, tomllib.TOMLDecodeError, TypeError, ValueError):
         return replace(CleanupConfig())
+
+
+@dataclass(frozen=True)
+class PreferencesConfig:
+    quantization: str
+    handsfree_enabled: bool
+    silence_stop_seconds: float
+    cleanup_enabled: bool
+    dedupe_stutters: bool
+    context_aware: bool
+    scratch_that: bool
+    add_trailing_space: bool
+    extra_fillers: tuple[str, ...]
+    dictionary: tuple[tuple[str, str], ...]
+
+
+def load_preferences(path: Path = CONFIG_PATH) -> PreferencesConfig:
+    """All settings represented by the native Preferences window."""
+    model_cfg = load_model(path)
+    handsfree_cfg = load_handsfree(path)
+    cleanup_cfg = load(path)
+    extra_fillers: tuple[str, ...] = ()
+    try:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+        cleanup_section = raw.get("cleanup", {})
+        if isinstance(cleanup_section, dict):
+            values = cleanup_section.get("extra_fillers", [])
+            if isinstance(values, list):
+                extra_fillers = tuple(str(value) for value in values)
+    except (FileNotFoundError, tomllib.TOMLDecodeError, TypeError, ValueError):
+        pass
+    return PreferencesConfig(
+        quantization=model_cfg.quantization,
+        handsfree_enabled=handsfree_cfg.enabled,
+        silence_stop_seconds=handsfree_cfg.silence_stop_seconds,
+        cleanup_enabled=cleanup_cfg.enabled,
+        dedupe_stutters=cleanup_cfg.dedupe_stutters,
+        context_aware=cleanup_cfg.context_aware,
+        scratch_that=cleanup_cfg.scratch_that,
+        add_trailing_space=cleanup_cfg.add_trailing_space,
+        extra_fillers=extra_fillers,
+        dictionary=cleanup_cfg.dictionary,
+    )
+
+
+def save_preferences(settings: PreferencesConfig, path: Path = CONFIG_PATH) -> None:
+    """Update known settings atomically while preserving TOML comments."""
+    if settings.quantization not in VALID_QUANTIZATION:
+        raise ValueError(f"Unsupported quantization: {settings.quantization}")
+    seconds = min(10.0, max(0.5, float(settings.silence_stop_seconds)))
+    try:
+        document = tomlkit.parse(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, tomlkit.exceptions.ParseError):
+        document = tomlkit.document()
+
+    for name in ("model", "handsfree", "cleanup"):
+        if name not in document or not isinstance(document[name], dict):
+            document[name] = tomlkit.table()
+
+    document["model"]["quantization"] = settings.quantization
+    document["handsfree"]["enabled"] = bool(settings.handsfree_enabled)
+    document["handsfree"]["silence_stop_seconds"] = seconds
+    document["cleanup"]["enabled"] = bool(settings.cleanup_enabled)
+    document["cleanup"]["dedupe_stutters"] = bool(settings.dedupe_stutters)
+    document["cleanup"]["context_aware"] = bool(settings.context_aware)
+    document["cleanup"]["scratch_that"] = bool(settings.scratch_that)
+    document["cleanup"]["add_trailing_space"] = bool(settings.add_trailing_space)
+    document["cleanup"]["extra_fillers"] = list(settings.extra_fillers)
+
+    dictionary = tomlkit.table()
+    seen_spoken: set[str] = set()
+    for spoken, replacement in settings.dictionary:
+        spoken = str(spoken).strip()
+        replacement = str(replacement).strip()
+        normalized = spoken.casefold()
+        if not spoken or not replacement:
+            raise ValueError("Dictionary entries cannot be blank.")
+        if normalized in seen_spoken:
+            raise ValueError(f"Duplicate dictionary phrase: {spoken}")
+        seen_spoken.add(normalized)
+        dictionary.add(spoken, replacement)
+    document["dictionary"] = dictionary
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(tomlkit.dumps(document), encoding="utf-8")
+    temp.replace(path)

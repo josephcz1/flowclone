@@ -3,13 +3,15 @@
 A borderless, non-activating NSPanel anchored to the lower-right corner. Text
 wraps at a fixed width and the panel grows UPWARD (bottom edge stays put) as
 the transcript lengthens; past ~7 lines the oldest words are trimmed with an
-ellipsis so the newest speech is always visible. A red dot beside the newest
-line pulses while the mic is live and goes solid gray while the accurate batch
-pass runs, so recording state is readable at a glance. It never takes focus and
-ignores the mouse, so the target app keeps keyboard focus. All AppKit calls
-happen on the main thread; worker threads must use the thread-safe
-show/update/finalize/hide wrappers.
+ellipsis so the newest speech is always visible. A small level meter beside
+the newest line dances red with the mic's input while recording — the instant
+answer to "is it hearing me?" — and goes solid gray while the accurate batch
+pass runs. It never takes focus and ignores the mouse, so the target app keeps
+keyboard focus. All AppKit calls happen on the main thread; worker threads
+must use the thread-safe show/update/finalize/hide/set_level wrappers.
 """
+
+import math
 
 import objc
 from AppKit import (
@@ -30,26 +32,34 @@ from AppKit import (
     NSWindowStyleMaskNonactivatingPanel,
 )
 from Foundation import NSMakeRect, NSObject
-from Quartz import (
-    CABasicAnimation,
-    CAMediaTimingFunction,
-    kCAMediaTimingFunctionEaseInEaseOut,
-)
 
 PILL_WIDTH = 380.0
-LABEL_X = 26.0
-LABEL_WIDTH = PILL_WIDTH - LABEL_X - 12.0
 V_PAD = 8.0
 LINE_HEIGHT = 16.0  # one line of the 12 pt system font
 MAX_TEXT_HEIGHT = 7 * LINE_HEIGHT  # growth cap; beyond it the head is trimmed
 CORNER_MARGIN = 20.0  # inset from the lower-right corner of the visible screen
 CORNER_RADIUS = 15.0
-DOT_SIZE = 8.0
-DOT_X = 13.0
-DOT_Y = V_PAD + 3.0  # vertically centred on the first (bottom) line of text
-PULSE_KEY = "flowclone.pulse"
-PULSE_PERIOD = 0.6  # seconds per half-cycle; autoreversed, so 1.2 s round trip
-PULSE_MIN_OPACITY = 0.25
+# The level meter: ascending bars beside the newest (bottom) line of text,
+# lit red in proportion to the mic's RMS while recording.
+BAR_COUNT = 5
+BAR_WIDTH = 3.0
+BAR_GAP = 2.0
+METER_X = 12.0
+LABEL_X = METER_X + BAR_COUNT * (BAR_WIDTH + BAR_GAP) + 3.0
+LABEL_WIDTH = PILL_WIDTH - LABEL_X - 12.0
+# Perceptual mapping from RMS to lit bars. Log scale, because loudness is:
+# ambient room noise sits near the floor, normal speech spans the middle.
+RMS_FLOOR = 0.003
+RMS_CEIL = 0.25
+
+
+def bars_for_rms(rms: float) -> int:
+    """How many of the BAR_COUNT bars to light; always ≥ 1 while recording,
+    so the meter reads as 'live' even in silence."""
+    if rms <= RMS_FLOOR:
+        return 1
+    frac = min(1.0, math.log(rms / RMS_FLOOR) / math.log(RMS_CEIL / RMS_FLOOR))
+    return 1 + round(frac * (BAR_COUNT - 1))
 
 
 class HudPanel(NSObject):
@@ -86,18 +96,23 @@ class HudPanel(NSObject):
             NSColor.blackColor().colorWithAlphaComponent_(0.8).CGColor()
         )
 
-        # The dot sits at the fixed bottom-left, beside the newest line of text
-        # (text wraps top-down, so the latest words are always at the bottom).
-        # A layer-backed view rather than a glyph, so Core Animation can pulse
-        # its opacity on the window server without any Python-side timer.
-        dot = NSView.alloc().initWithFrame_(
-            NSMakeRect(DOT_X, DOT_Y, DOT_SIZE, DOT_SIZE)
-        )
-        dot.setWantsLayer_(True)
-        dot_layer = dot.layer()
-        dot_layer.setCornerRadius_(DOT_SIZE / 2)
-        dot_layer.setBackgroundColor_(NSColor.systemRedColor().CGColor())
-        content.addSubview_(dot)
+        # The meter sits at the fixed bottom-left, beside the newest line of
+        # text (text wraps top-down, so the latest words are always at the
+        # bottom): ascending bars, bottom-aligned like an audio level meter.
+        self._lit_color = NSColor.systemRedColor().CGColor()
+        self._dim_color = NSColor.whiteColor().colorWithAlphaComponent_(0.18).CGColor()
+        self._done_color = NSColor.systemGrayColor().CGColor()
+        bars = []
+        for i in range(BAR_COUNT):
+            height = 4.0 + i * (LINE_HEIGHT - 4.0) / (BAR_COUNT - 1)
+            bar = NSView.alloc().initWithFrame_(
+                NSMakeRect(METER_X + i * (BAR_WIDTH + BAR_GAP), V_PAD, BAR_WIDTH, height)
+            )
+            bar.setWantsLayer_(True)
+            bar.layer().setCornerRadius_(BAR_WIDTH / 2)
+            bar.layer().setBackgroundColor_(self._dim_color)
+            content.addSubview_(bar)
+            bars.append(bar)
 
         label = NSTextField.labelWithString_("")
         label.setFrame_(NSMakeRect(LABEL_X, V_PAD, LABEL_WIDTH, LINE_HEIGHT))
@@ -109,8 +124,9 @@ class HudPanel(NSObject):
         content.addSubview_(label)
 
         self._panel = panel
-        self._dot = dot
+        self._bars = bars
         self._label = label
+        self._finalizing = False
         self._origin = (0.0, 0.0)
         self._anchor_to_screen()
         return self
@@ -119,48 +135,35 @@ class HudPanel(NSObject):
 
     def showText_(self, text):
         self._anchor_to_screen()
-        self._dot.layer().setBackgroundColor_(NSColor.systemRedColor().CGColor())
+        self._finalizing = False
+        self._paint_bars(1)
         self._layout(text)
         self._panel.orderFrontRegardless()
-        # Started after the panel is on screen: Core Animation suspends layer
-        # animations for off-screen windows, and one attached earlier would come
-        # back mid-cycle rather than from full opacity.
-        self._start_pulse()
 
     def updateText_(self, text):
         self._layout(text)
 
+    def setLevelRms_(self, rms):
+        if self._finalizing:
+            return  # the last blocks drain after release; keep the gray state
+        self._paint_bars(bars_for_rms(float(rms)))
+
     def finalizeHud_(self, _):
-        self._stop_pulse()
-        self._dot.layer().setBackgroundColor_(NSColor.systemGrayColor().CGColor())
+        self._finalizing = True
+        for bar in self._bars:
+            bar.layer().setBackgroundColor_(self._done_color)
 
     def hideHud_(self, _):
-        self._stop_pulse()
         self._panel.orderOut_(None)
 
     # ---- helpers (plain Python, not exposed as selectors) ----
 
     @objc.python_method
-    def _start_pulse(self):
-        """Breathe the dot's opacity while recording, forever until stopped."""
-        layer = self._dot.layer()
-        layer.removeAnimationForKey_(PULSE_KEY)
-        anim = CABasicAnimation.animationWithKeyPath_("opacity")
-        anim.setFromValue_(1.0)
-        anim.setToValue_(PULSE_MIN_OPACITY)
-        anim.setDuration_(PULSE_PERIOD)
-        anim.setAutoreverses_(True)
-        anim.setRepeatCount_(float("inf"))
-        anim.setTimingFunction_(
-            CAMediaTimingFunction.functionWithName_(kCAMediaTimingFunctionEaseInEaseOut)
-        )
-        layer.addAnimation_forKey_(anim, PULSE_KEY)
-
-    @objc.python_method
-    def _stop_pulse(self):
-        # Removing the animation snaps the layer back to its model opacity (1.0),
-        # so the gray finalizing dot is always fully solid.
-        self._dot.layer().removeAnimationForKey_(PULSE_KEY)
+    def _paint_bars(self, lit: int):
+        for i, bar in enumerate(self._bars):
+            bar.layer().setBackgroundColor_(
+                self._lit_color if i < lit else self._dim_color
+            )
 
     @objc.python_method
     def _layout(self, text):
@@ -214,6 +217,11 @@ class HudPanel(NSObject):
     @objc.python_method
     def update(self, text: str) -> None:
         self._call("updateText:", text)
+
+    @objc.python_method
+    def set_level(self, rms: float) -> None:
+        """Feed one mic block's RMS; drives the level meter. Any thread."""
+        self._call("setLevelRms:", float(rms))
 
     @objc.python_method
     def finalize(self) -> None:

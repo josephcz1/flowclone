@@ -65,6 +65,27 @@ def _tidy(text: str, capitalize: bool = True) -> str:
     return text[0].lower() + text[1:] if text[0].isupper() else text
 
 
+# The whole utterance must be one of these (after dropping fillers and
+# punctuation) — "scratch that idea" is content, not a command.
+SCRATCH_PHRASES = frozenset({"scratch that", "delete that"})
+
+
+def is_scratch_command(text: str, cfg: CleanupConfig) -> bool:
+    """True when the utterance is a scratch command rather than dictation.
+
+    Deliberately strict: normalize (lowercase, strip punctuation, drop fillers)
+    and require an exact phrase match. A false positive silently deletes the
+    user's text; a false negative pastes "scratch that", which they can see.
+    """
+    if not cfg.scratch_that:
+        return False
+    fillers = {f.lower() for f in cfg.fillers}
+    words = [
+        w for w in re.findall(r"[a-z']+", text.lower()) if w not in fillers
+    ]
+    return " ".join(words) in SCRATCH_PHRASES
+
+
 def clean(text: str, cfg: CleanupConfig, join=None) -> str:
     """Return the cleaned transcript. Dictionary always applies; the filler and
     stutter passes are skipped when cleanup is disabled.

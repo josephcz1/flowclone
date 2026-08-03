@@ -18,12 +18,75 @@ import time
 
 import numpy as np
 
-from flowclone import cleanup, config, context, inject
+from flowclone import cleanup, config, context, history, inject
 from flowclone.audio import SAMPLE_RATE, MicRecorder
+from flowclone.hotkey import ReleaseWatchdog, right_cmd_sources
 from flowclone.stt import Transcriber, to_mx
 
 CHUNK_SECONDS = 0.5
 MIN_UTTERANCE_SECONDS = 0.35
+# Absolute backstop: even if every release signal fails, finalize and paste
+# rather than record forever.
+MAX_RECORD_SECONDS = 90.0
+# A press-to-release shorter than this is a tap (lock hands-free), not a hold.
+# The release watchdog also waits this long, so it can't end a tap's session
+# before the release handler has decided to lock it.
+TAP_MAX_SECONDS = 0.35
+# A locked session where speech never starts ends itself rather than sitting
+# open until the 90 s cap — an accidental tap self-cancels quietly.
+NO_SPEECH_STOP_SECONDS = 6.0
+
+
+def paste_target_matches(expected: str | None, current: str | None) -> bool:
+    """Fail closed unless the release-time app is still focused."""
+    return expected is not None and expected == current
+
+
+class SilenceStopper:
+    """Decides when a hands-free recording has gone quiet for good.
+
+    The speech threshold adapts to the mic's ambient level (the quietest of
+    the first few blocks), and speech must actually be heard once before
+    silence can stop anything. Mid-speech dips get hysteresis: anything above
+    half the speech threshold counts as still talking.
+    """
+
+    FLOOR_BLOCKS = 5
+    MIN_SPEECH_RMS = 0.008
+
+    def __init__(self, stop_after: float) -> None:
+        self.stop_after = stop_after
+        self._floor_samples: list[float] = []
+        self._speech_thresh: float | None = None
+        self._started = False
+        self._t0: float | None = None
+        self._last_voiced = 0.0
+
+    @property
+    def speech_started(self) -> bool:
+        return self._started
+
+    def update(self, rms: float, now: float) -> bool:
+        """Feed one audio block's RMS; True once the recording should stop."""
+        if self._t0 is None:
+            self._t0 = now
+        if self._speech_thresh is None:
+            self._floor_samples.append(rms)
+            if len(self._floor_samples) < self.FLOOR_BLOCKS:
+                return False
+            # min, not median: the user often starts talking during the floor
+            # window, and one quiet block is enough to anchor the ambient level.
+            floor = min(self._floor_samples)
+            self._speech_thresh = max(self.MIN_SPEECH_RMS, 3.0 * floor)
+            return False
+        if rms >= self._speech_thresh:
+            self._started = True
+            self._last_voiced = now
+        elif self._started and rms >= 0.5 * self._speech_thresh:
+            self._last_voiced = now
+        if not self._started:
+            return now - self._t0 >= NO_SPEECH_STOP_SECONDS
+        return now - self._last_voiced >= self.stop_after
 
 
 def _live_line(text: str) -> None:
@@ -45,27 +108,46 @@ class DictationSession(threading.Thread):
         hud=None,
         cleanup_cfg: config.CleanupConfig | None = None,
         on_state=None,
+        handsfree_cfg: config.HandsFreeConfig | None = None,
+        on_history=None,
+        on_notice=None,
     ) -> None:
         super().__init__(daemon=True)
         self.transcriber = transcriber
         self.hud = hud
         self.cleanup_cfg = cleanup_cfg or config.CleanupConfig()
+        self.handsfree_cfg = handsfree_cfg or config.HandsFreeConfig()
         # Reports pipeline stage to the menu bar ("recording"/"processing"/
         # "idle"); a no-op when running headless from the terminal.
         self.on_state = on_state or (lambda _state: None)
+        self.on_history = on_history or (lambda: None)
+        self.on_notice = on_notice or (lambda _title, _message: None)
         self.stop_event = threading.Event()
         self.canceled = False
         self.t_release: float | None = None
-        # Text before the caret, sampled once at the top of the recording. None
-        # means the focused app wouldn't tell us.
+        # Text before the release-time caret. None means the focused app would
+        # not tell us, or focus moved before it could be sampled safely.
         self.before_caret: str | None = None
         self.ctx_source = "blind"
-        self.app_id: str | None = None
         self.ctx_ms = 0.0
+        self.release_source = "hold"
+        self.locked = False
+        # The app focused when recording ends owns this dictation. Final STT
+        # takes long enough for focus to change, so paste validates it again.
+        self.target_app_id: str | None = None
+        self.no_speech = False
 
     def release(self) -> None:
+        if self.stop_event.is_set():
+            return
+        self.target_app_id = context.frontmost_app_id()
         self.t_release = time.perf_counter()
         self.stop_event.set()
+
+    def lock(self) -> None:
+        """Continue hands-free: the hold was a tap, not push-to-talk."""
+        if not self.stop_event.is_set():
+            self.locked = True
 
     def cancel(self) -> None:
         self.canceled = True
@@ -93,33 +175,46 @@ class DictationSession(threading.Thread):
             self.hud.show("listening…")
         _live_line("listening…")
 
-        # Sample the caret now, not at paste time. You are about to speak for a
-        # second or more, so the read is free here, and re-deriving it every
-        # recording means there is no cached "where was the cursor" state to
-        # invalidate when you switch apps or click elsewhere.
-        if self.cleanup_cfg.context_aware:
-            t_ctx = time.perf_counter()
-            self.app_id = context.frontmost_app_id()
-            # Our own last paste first: it costs nothing and, unlike AX, it can
-            # answer inside Electron apps and terminals.
-            self.before_caret = context.recall(self.app_id)
-            self.ctx_source = "self"
-            if self.before_caret is None:
-                self.before_caret = context.read_before_caret()
-                self.ctx_source = "ax" if self.before_caret is not None else "blind"
-            self.ctx_ms = (time.perf_counter() - t_ctx) * 1000
-
         blocks: list[np.ndarray] = []
         pending: list[np.ndarray] = []
         pending_len = 0
         chunk_frames = int(CHUNK_SECONDS * SAMPLE_RATE)
         n_partials = 0
 
+        # The tap's release event is not guaranteed to arrive: macOS disables
+        # taps whose (GIL-starved) callback lags, and a dropped release used to
+        # leave this loop running forever. The watchdog polls independent
+        # sources for the physical key state instead — see hotkey.right_cmd_sources.
+        watchdog = ReleaseWatchdog()
+        stopper = SilenceStopper(self.handsfree_cfg.silence_stop_seconds)
+        t_start = time.perf_counter()
         with self.transcriber.stream() as stream:
             while not self.stop_event.is_set():
+                now = time.perf_counter()
+                if (
+                    not self.locked
+                    and now - t_start > TAP_MAX_SECONDS
+                    and watchdog.released(right_cmd_sources())
+                ):
+                    self.release_source = "watchdog"
+                    self.release()
+                    break
+                if now - t_start > MAX_RECORD_SECONDS:
+                    self.release_source = "cap"
+                    self.release()
+                    break
                 block = mic.read(timeout=0.05)
                 if block is None:
                     continue
+                rms = float(np.sqrt(np.mean(block * block)))
+                if self.hud:
+                    self.hud.set_level(rms)
+                quiet = stopper.update(rms, now)
+                if self.locked and quiet:
+                    self.no_speech = not stopper.speech_started
+                    self.release_source = "no_speech" if self.no_speech else "silence"
+                    self.release()
+                    break
                 blocks.append(block)
                 pending.append(block)
                 pending_len += len(block)
@@ -146,10 +241,13 @@ class DictationSession(threading.Thread):
         sys.stdout.flush()
 
         if self.canceled:
-            self.on_state("idle")
-            if self.hud:
-                self.hud.hide()
+            self._finish_ui()
             return  # the hold was a ⌘-shortcut, not dictation
+
+        if self.no_speech:
+            self._finish_ui()
+            print("  (ignored: hands-free recording ended before speech started)")
+            return
 
         audio = np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.float32)
         duration = len(audio) / SAMPLE_RATE
@@ -165,28 +263,63 @@ class DictationSession(threading.Thread):
             self.hud.finalize()  # gray dot while the accurate batch pass runs
         t0 = time.perf_counter()
         text = self.transcriber.batch_text(to_mx(audio)).strip()
+        if self.canceled:
+            self._finish_ui()
+            return  # Pause may have arrived while the batch pass was running.
+        if cleanup.is_scratch_command(text, self.cleanup_cfg):
+            self._scratch()
+            return
+        # Resolve context against the release-time target, after speech has
+        # ended. This handles clicks or app switches during a dictation; the
+        # final focus check below still protects the small gap before Cmd-V.
+        if self.cleanup_cfg.context_aware and paste_target_matches(
+            self.target_app_id, context.frontmost_app_id()
+        ):
+            t_ctx = time.perf_counter()
+            self.before_caret = context.recall(self.target_app_id)
+            self.ctx_source = "self"
+            if self.before_caret is None:
+                self.before_caret = context.read_before_caret()
+                self.ctx_source = "ax" if self.before_caret is not None else "blind"
+            self.ctx_ms = (time.perf_counter() - t_ctx) * 1000
         join = context.decide(self.before_caret) if self.before_caret is not None else None
         text = cleanup.clean(text, self.cleanup_cfg, join)
         batch_ms = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
+        current_app_id = context.frontmost_app_id()
+        outcome = "empty"
         if not text:
             paste_note = "nothing to paste"
+        elif not paste_target_matches(self.target_app_id, current_app_id):
+            outcome = "target_changed"
+            paste_note = "NOT pasted — target changed; saved in history"
+            self.on_notice(
+                "Dictation saved",
+                "The focused app changed during finalization. Use Paste Last Dictation.",
+            )
         elif not inject.can_post_events():
+            outcome = "accessibility_blocked"
             paste_note = "NOT pasted — grant Accessibility"
         elif inject.paste_text(text):
+            outcome = "pasted"
             paste_note = "pasted"
             # The caret is now sitting at the end of this. It stays true until
             # the event tap sees a key or a click.
             context.remember(text, context.frontmost_app_id())
         else:
+            outcome = "secure_input"
             paste_note = "NOT pasted — secure input field"
+        if text:
+            try:
+                history.add(text, self.target_app_id, outcome)
+                self.on_history()
+            except OSError as exc:
+                print(f"  history error: {exc}", file=sys.stderr)
         paste_ms = (time.perf_counter() - t0) * 1000
         total_ms = (time.perf_counter() - (self.t_release or t0)) * 1000
 
-        self.on_state("idle")
-        if self.hud:
-            self.hud.hide()
+        self._finish_ui()
         print(f"» {text}")
         if self.cleanup_cfg.context_aware:
             if join is None:
@@ -201,8 +334,114 @@ class DictationSession(threading.Thread):
         print(
             f"  [{duration:.1f}s audio · mic open {mic_open_ms:.0f}ms · "
             f"{n_partials} partials · finalize {batch_ms:.0f}ms · "
-            f"{paste_note} {paste_ms:.0f}ms · release→done {total_ms:.0f}ms]"
+            f"{paste_note} {paste_ms:.0f}ms · release→done {total_ms:.0f}ms"
+            + (
+                f" · release via {self.release_source}"
+                if self.release_source != "hold"
+                else ""
+            )
+            + "]"
         )
+
+    def _scratch(self) -> None:
+        """Undo the last dictation instead of pasting the words "scratch that".
+
+        Only acts when context still vouches for the caret: we pasted into this
+        same app and no key or click has happened since. Anything less certain
+        does nothing — a beeped no-op is recoverable, deleting 40 characters of
+        someone else's text is not.
+        """
+        current_app_id = context.frontmost_app_id()
+        last = context.recall(current_app_id)
+        if not paste_target_matches(self.target_app_id, current_app_id):
+            note = "NOT scratched — target changed"
+        elif last is None:
+            note = "nothing to scratch — no dictation still at the caret"
+        elif not inject.can_post_events():
+            note = "NOT scratched — grant Accessibility"
+        elif inject.undo():
+            context.invalidate()
+            note = "scratched last dictation (undo)"
+        else:
+            note = "NOT scratched — secure input field"
+        self._finish_ui()
+        print(f"» (scratch that)\n  [{note}]")
+
+    def _finish_ui(self) -> None:
+        self.on_state("idle")
+        if self.hud:
+            self.hud.hide()
+
+
+class SessionController:
+    """Press/release/cancel logic shared by the menu-bar and terminal frontends.
+
+    Holding Right ⌘ is push-to-talk. A quick tap (released within
+    TAP_MAX_SECONDS) locks the recording hands-free; it ends on the next tap,
+    on silence (SilenceStopper), or at the length cap.
+    """
+
+    def __init__(
+        self,
+        transcriber,
+        hud=None,
+        cleanup_cfg=None,
+        handsfree_cfg=None,
+        on_state=None,
+        on_history=None,
+        on_notice=None,
+        session_factory=None,
+    ) -> None:
+        self.transcriber = transcriber
+        self.hud = hud
+        self.cleanup_cfg = cleanup_cfg
+        self.handsfree_cfg = handsfree_cfg or config.HandsFreeConfig()
+        self.on_state = on_state
+        self.on_history = on_history
+        self.on_notice = on_notice
+        self.session_factory = session_factory or DictationSession
+        self.session = None
+        self._pressed_at = 0.0
+
+    def on_press(self) -> None:
+        if self.session is not None and self.session.is_alive():
+            if self.session.locked:
+                self.session.release_source = "tap"
+                self.session.release()
+            return  # not locked: still finalizing a previous dictation
+        self._pressed_at = time.perf_counter()
+        self.session = self.session_factory(
+            self.transcriber,
+            self.hud,
+            self.cleanup_cfg,
+            on_state=self.on_state,
+            handsfree_cfg=self.handsfree_cfg,
+            on_history=self.on_history,
+            on_notice=self.on_notice,
+        )
+        self.session.start()
+
+    def on_release(self) -> None:
+        session = self.session
+        if session is None or session.stop_event.is_set():
+            return  # nothing recording, or this is the stop-tap's own release
+        if (
+            self.handsfree_cfg.enabled
+            and time.perf_counter() - self._pressed_at < TAP_MAX_SECONDS
+        ):
+            session.lock()
+        else:
+            session.release()
+
+    def on_cancel(self) -> None:
+        if self.session is not None:
+            self.session.cancel()
+
+    def cancel_active(self) -> None:
+        """Stop and discard an active recording or in-flight finalization."""
+        if self.session is not None and self.session.is_alive():
+            self.session.release_source = "pause"
+            self.session.cancel()
 
 
 def _load_transcriber() -> Transcriber:
@@ -282,29 +521,21 @@ def run_terminal_daemon() -> int:
             "  Until granted, transcripts only print here."
         )
     hud = HudPanel.alloc().init()
-    state: dict = {"session": None}
+    controller = SessionController(
+        transcriber, hud, cleanup_cfg, handsfree_cfg=config.load_handsfree()
+    )
 
-    def on_press() -> None:
-        session = state["session"]
-        if session is not None and session.is_alive():
-            return
-        state["session"] = DictationSession(transcriber, hud, cleanup_cfg)
-        state["session"].start()
-
-    def on_release() -> None:
-        if state["session"] is not None:
-            state["session"].release()
-
-    def on_cancel() -> None:
-        if state["session"] is not None:
-            state["session"].cancel()
-
-    print("hold RIGHT ⌘ anywhere, speak, release. Ctrl-C here to quit.")
+    print(
+        "hold RIGHT ⌘ anywhere, speak, release — or quick-tap it to go "
+        "hands-free (tap again or pause to finish). Ctrl-C here to quit."
+    )
     # CFRunLoopRun is a C loop Python never preempts, so a Python-level SIGINT
     # handler would only fire on the next keystroke; default disposition quits now.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     try:
-        HoldToTalk(on_press, on_release, on_cancel).install()
+        HoldToTalk(
+            controller.on_press, controller.on_release, controller.on_cancel
+        ).install()
     except PermissionError as exc:
         print(f"\n{exc}", file=sys.stderr)
         return 1
@@ -403,15 +634,23 @@ def run_hudtest() -> int:
 
     hud.showText_("listening…")
     pump(0.8)
-    for text in (
-        "Um, so basically",
-        "Um, so basically I want to refactor",
-        "Um, so basically I want to refactor the API endpoint in the repo",
-        "…so basically I want to refactor the API endpoint in the repo so that "
-        "Claude can parse the JSON config faster",
+    for text, levels in (
+        ("Um, so basically", (0.02, 0.09, 0.04)),
+        ("Um, so basically I want to refactor", (0.15, 0.06, 0.20)),
+        (
+            "Um, so basically I want to refactor the API endpoint in the repo",
+            (0.03, 0.12, 0.002),
+        ),
+        (
+            "…so basically I want to refactor the API endpoint in the repo so that "
+            "Claude can parse the JSON config faster",
+            (0.08, 0.25, 0.05),
+        ),
     ):
         hud.updateText_(text)
-        pump(0.7)
+        for rms in levels:
+            hud.setLevelRms_(rms)
+            pump(0.23)
     hud.finalizeHud_(None)
     pump(0.6)
     hud.hideHud_(None)

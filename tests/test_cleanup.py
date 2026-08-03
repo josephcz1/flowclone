@@ -3,6 +3,8 @@
 Run: uv run pytest
 """
 
+import pytest
+
 from flowclone.cleanup import clean
 from flowclone.config import CleanupConfig, load
 from flowclone.context import Join, decide
@@ -126,3 +128,54 @@ def test_default_config_loads():
     cfg = load()
     assert isinstance(cfg, CleanupConfig)
     assert any(spoken == "cloud" for spoken, _ in cfg.dictionary)
+
+
+def test_preferences_round_trip_preserves_comments_and_unknown_settings(tmp_path):
+    from flowclone.config import PreferencesConfig, load_preferences, save_preferences
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "# keep this comment\n"
+        '[model]\nquantization = "8bit"\n\n'
+        "[unknown]\nvalue = 42\n"
+    )
+    settings = PreferencesConfig(
+        quantization="4bit",
+        handsfree_enabled=False,
+        silence_stop_seconds=2.25,
+        cleanup_enabled=True,
+        dedupe_stutters=False,
+        context_aware=True,
+        scratch_that=False,
+        add_trailing_space=True,
+        extra_fillers=("like", "you know"),
+        dictionary=(("cloud", "Claude"),),
+    )
+
+    save_preferences(settings, path)
+    loaded = load_preferences(path)
+
+    assert loaded == settings
+    saved = path.read_text()
+    assert "# keep this comment" in saved
+    assert "[unknown]" in saved
+    assert "value = 42" in saved
+
+
+def test_preferences_reject_invalid_quantization(tmp_path):
+    from flowclone.config import PreferencesConfig, save_preferences
+
+    settings = PreferencesConfig(
+        quantization="2bit",
+        handsfree_enabled=True,
+        silence_stop_seconds=1.5,
+        cleanup_enabled=True,
+        dedupe_stutters=True,
+        context_aware=True,
+        scratch_that=True,
+        add_trailing_space=False,
+        extra_fillers=(),
+        dictionary=(),
+    )
+    with pytest.raises(ValueError, match="Unsupported quantization"):
+        save_preferences(settings, tmp_path / "config.toml")

@@ -15,6 +15,7 @@ import Quartz
 from AppKit import NSBeep, NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
 
 V_KEYCODE = 9  # kVK_ANSI_V
+Z_KEYCODE = 6  # kVK_ANSI_Z
 SYNTHETIC_MARK = 0xF10C  # tags our own events so the hotkey tap ignores them
 PASTE_SETTLE_SECONDS = 0.3  # target app must read the pasteboard before restore
 # Clipboard managers honoring the nspasteboard.org convention skip this type,
@@ -71,10 +72,10 @@ def _restore_pasteboard(pb, snapshot, expected_change_count: int | None = None) 
         pass  # losing the old clipboard beats crashing mid-dictation
 
 
-def _post_cmd_v() -> None:
+def _post_key(keycode: int, flags: int = 0) -> None:
     for is_down in (True, False):
-        event = Quartz.CGEventCreateKeyboardEvent(None, V_KEYCODE, is_down)
-        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+        event = Quartz.CGEventCreateKeyboardEvent(None, keycode, is_down)
+        Quartz.CGEventSetFlags(event, flags)
         Quartz.CGEventSetIntegerValueField(
             event, Quartz.kCGEventSourceUserData, SYNTHETIC_MARK
         )
@@ -92,13 +93,31 @@ def paste_text(text: str) -> bool:
     pb.setString_forType_(text, NSPasteboardTypeString)
     pb.setString_forType_("", TRANSIENT_TYPE)
     change_count = pb.changeCount()
-    _post_cmd_v()
+    _post_key(V_KEYCODE, Quartz.kCGEventFlagMaskCommand)
     timer = threading.Timer(
         PASTE_SETTLE_SECONDS, _restore_pasteboard, args=(pb, snapshot, change_count)
     )
     timer.daemon = True
     timer.start()
     return True
+
+
+def undo() -> bool:
+    """Post one synthetic Cmd-Z, used for a verified "scratch that"."""
+    if secure_input_active():
+        NSBeep()
+        return False
+    _post_key(Z_KEYCODE, Quartz.kCGEventFlagMaskCommand)
+    return True
+
+
+def copy_text(text: str) -> bool:
+    """Put text on the clipboard persistently for an explicit Copy action."""
+    if not text:
+        return False
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    return bool(pb.setString_forType_(text, NSPasteboardTypeString))
 
 
 def clipboard_roundtrip_test() -> bool:

@@ -83,3 +83,59 @@ def test_a_shortcut_cancels_only_once(tap):
     for _ in range(3):
         tap._handle(None, Quartz.kCGEventKeyDown, key_event(), None)
     assert tap.calls == ["cancel"]
+
+
+def test_recover_resyncs_a_stale_hold(tap):
+    """A release dropped by a dead tap leaves _held True; _recover clears it."""
+    tap._held = True
+    tap._canceled = True
+    tap._recover(key_down=False)
+    assert not tap._held
+    assert not tap._canceled
+    assert tap.calls == []  # the session ended itself; no callback re-fires
+
+
+def test_recover_leaves_a_genuine_hold_alone(tap):
+    tap._held = True
+    tap._recover(key_down=True)
+    assert tap._held
+
+
+def test_right_cmd_poll_answers_without_a_tap():
+    from flowclone.hotkey import right_cmd_is_down
+
+    assert right_cmd_is_down() in (True, False)
+
+
+def test_watchdog_releases_when_a_proven_source_goes_up():
+    from flowclone.hotkey import ReleaseWatchdog
+
+    w = ReleaseWatchdog()
+    assert not w.released((False, True, None))   # holding: flags source sees it
+    assert not w.released((False, True, True))   # monitor catches up mid-hold
+    assert w.released((False, False, False))     # both proven sources say up
+
+
+def test_watchdog_never_fires_when_every_source_is_blind():
+    from flowclone.hotkey import ReleaseWatchdog
+
+    w = ReleaseWatchdog()
+    for _ in range(50):
+        assert not w.released((False, False, None))
+
+
+def test_watchdog_waits_for_a_lagging_proven_source():
+    from flowclone.hotkey import ReleaseWatchdog
+
+    w = ReleaseWatchdog()
+    assert not w.released((False, True, True))
+    assert not w.released((False, False, True))  # monitor event not processed yet
+    assert w.released((False, False, False))
+
+
+def test_blind_source_cannot_keep_a_dictation_alive():
+    from flowclone.hotkey import ReleaseWatchdog
+
+    w = ReleaseWatchdog()
+    assert not w.released((False, True, None))
+    assert w.released((False, False, None))  # None never armed, gets no vote
