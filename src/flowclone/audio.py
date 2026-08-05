@@ -22,14 +22,29 @@ class MicRecorder:
 
     def start(self) -> None:
         self._queue = queue.Queue()
-        self._stream = sd.InputStream(
+        try:
+            self._stream = self._open()
+        except Exception:
+            # PortAudio snapshots the CoreAudio device list once at init and
+            # never refreshes it, so after the audio setup changes under a
+            # long-running daemon (sleep/wake, headphones, a conference app's
+            # virtual device) every open fails even though the mic is fine.
+            # Re-initializing takes a fresh snapshot; safe here because this
+            # process never holds another stream open.
+            sd._terminate()
+            sd._initialize()
+            self._stream = self._open()
+
+    def _open(self) -> sd.InputStream:
+        stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
             blocksize=BLOCK_FRAMES,
             callback=self._on_block,
         )
-        self._stream.start()
+        stream.start()
+        return stream
 
     def _on_block(self, indata, frames, time_info, status) -> None:
         self._queue.put(indata[:, 0].copy())

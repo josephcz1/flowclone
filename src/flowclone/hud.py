@@ -8,7 +8,8 @@ the newest line dances red with the mic's input while recording — the instant
 answer to "is it hearing me?" — and goes solid gray while the accurate batch
 pass runs. It never takes focus and ignores the mouse, so the target app keeps
 keyboard focus. All AppKit calls happen on the main thread; worker threads
-must use the thread-safe show/update/finalize/hide/set_level wrappers.
+must use the thread-safe show/update/finalize/hide/set_level/flash_error
+wrappers.
 """
 
 import math
@@ -31,7 +32,7 @@ from AppKit import (
     NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel,
 )
-from Foundation import NSMakeRect, NSObject
+from Foundation import NSMakeRect, NSNumber, NSObject
 
 PILL_WIDTH = 380.0
 V_PAD = 8.0
@@ -47,6 +48,8 @@ BAR_GAP = 2.0
 METER_X = 12.0
 LABEL_X = METER_X + BAR_COUNT * (BAR_WIDTH + BAR_GAP) + 3.0
 LABEL_WIDTH = PILL_WIDTH - LABEL_X - 12.0
+# How long an error flash (e.g. "mic unavailable") stays up before auto-hiding.
+ERROR_FLASH_SECONDS = 2.5
 # Perceptual mapping from RMS to lit bars. Log scale, because loudness is:
 # ambient room noise sits near the floor, normal speech spans the middle.
 RMS_FLOOR = 0.003
@@ -127,6 +130,10 @@ class HudPanel(NSObject):
         self._bars = bars
         self._label = label
         self._finalizing = False
+        # Bumped by every show/flash; a pending flash auto-hide only fires if
+        # its generation is still current, so it can never hide a session that
+        # started after the flash.
+        self._flash_gen = 0
         self._origin = (0.0, 0.0)
         self._anchor_to_screen()
         return self
@@ -134,11 +141,29 @@ class HudPanel(NSObject):
     # ---- main-thread selectors ----
 
     def showText_(self, text):
+        self._flash_gen += 1
         self._anchor_to_screen()
         self._finalizing = False
         self._paint_bars(1)
         self._layout(text)
         self._panel.orderFrontRegardless()
+
+    def flashErrorText_(self, text):
+        """Show `text` with the meter solid red, then auto-hide."""
+        self._flash_gen += 1
+        self._anchor_to_screen()
+        self._finalizing = True  # freeze set_level so nothing repaints the bars
+        for bar in self._bars:
+            bar.layer().setBackgroundColor_(self._lit_color)
+        self._layout(text)
+        self._panel.orderFrontRegardless()
+        self.performSelector_withObject_afterDelay_(
+            "hideFlash:", NSNumber.numberWithLong_(self._flash_gen), ERROR_FLASH_SECONDS
+        )
+
+    def hideFlash_(self, gen):
+        if gen.longValue() == self._flash_gen:
+            self._panel.orderOut_(None)
 
     def updateText_(self, text):
         self._layout(text)
@@ -222,6 +247,11 @@ class HudPanel(NSObject):
     def set_level(self, rms: float) -> None:
         """Feed one mic block's RMS; drives the level meter. Any thread."""
         self._call("setLevelRms:", float(rms))
+
+    @objc.python_method
+    def flash_error(self, text: str) -> None:
+        """Show an error pill that hides itself after ERROR_FLASH_SECONDS."""
+        self._call("flashErrorText:", text)
 
     @objc.python_method
     def finalize(self) -> None:
