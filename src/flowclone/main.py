@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
@@ -45,22 +46,37 @@ def paste_target_matches(expected: str | None, current: str | None) -> bool:
 class SilenceStopper:
     """Decides when a hands-free recording has gone quiet for good.
 
-    The speech threshold adapts to the mic's ambient level (the quietest of
-    the first few blocks), and speech must actually be heard once before
-    silence can stop anything. Mid-speech dips get hysteresis: anything above
-    half the speech threshold counts as still talking.
+    The speech threshold tracks the mic's ambient level: anchored to the
+    quietest of the first few blocks, then re-anchored whenever sub-threshold
+    noise persists — a fan spinning up mid-dictation must raise the floor, not
+    postpone the stop forever. Speech must actually be heard once before
+    silence can stop anything. Mid-speech dips get hysteresis (anything above
+    half the speech threshold counts as still talking), but only within
+    stop_after of the last clearly-voiced block, so noise sitting in that band
+    can't starve the silence timer indefinitely. As a last resort, a level
+    that stays flat for a whole stop_after window is machinery, not speech,
+    and stops the recording no matter how loud it is.
     """
 
     FLOOR_BLOCKS = 5
     MIN_SPEECH_RMS = 0.008
+    # Ambient floor ratchet: sustained sub-threshold noise lifts the floor a
+    # few percent per 0.1 s block (fully re-anchors in a couple of seconds);
+    # any quieter block snaps it straight back down.
+    FLOOR_RISE = 1.03
+    # Speech at 0.1 s granularity swings far more than this between blocks;
+    # a window whose max/min stays under it is a fan or AC, not a voice.
+    FLAT_RATIO = 1.5
 
     def __init__(self, stop_after: float) -> None:
         self.stop_after = stop_after
         self._floor_samples: list[float] = []
-        self._speech_thresh: float | None = None
+        self._floor: float | None = None
         self._started = False
         self._t0: float | None = None
         self._last_voiced = 0.0
+        self._last_clear = 0.0
+        self._recent: deque[tuple[float, float]] = deque()
 
     @property
     def speech_started(self) -> bool:
@@ -70,23 +86,41 @@ class SilenceStopper:
         """Feed one audio block's RMS; True once the recording should stop."""
         if self._t0 is None:
             self._t0 = now
-        if self._speech_thresh is None:
+        if self._floor is None:
             self._floor_samples.append(rms)
             if len(self._floor_samples) < self.FLOOR_BLOCKS:
                 return False
             # min, not median: the user often starts talking during the floor
             # window, and one quiet block is enough to anchor the ambient level.
-            floor = min(self._floor_samples)
-            self._speech_thresh = max(self.MIN_SPEECH_RMS, 3.0 * floor)
+            self._floor = min(self._floor_samples)
             return False
-        if rms >= self._speech_thresh:
+        thresh = max(self.MIN_SPEECH_RMS, 3.0 * self._floor)
+        if rms >= thresh:
             self._started = True
             self._last_voiced = now
-        elif self._started and rms >= 0.5 * self._speech_thresh:
-            self._last_voiced = now
+            self._last_clear = now
+        else:
+            self._floor = min(rms, self._floor * self.FLOOR_RISE)
+            if (
+                self._started
+                and rms >= 0.5 * thresh
+                and now - self._last_clear <= self.stop_after
+            ):
+                self._last_voiced = now
+        self._recent.append((now, rms))
+        while now - self._recent[0][0] > self.stop_after:
+            self._recent.popleft()
+        if self._started and self._is_flat(now):
+            return True
         if not self._started:
             return now - self._t0 >= NO_SPEECH_STOP_SECONDS
         return now - self._last_voiced >= self.stop_after
+
+    def _is_flat(self, now: float) -> bool:
+        if now - self._recent[0][0] < 0.9 * self.stop_after:
+            return False  # window doesn't span a full silence period yet
+        levels = [rms for _, rms in self._recent]
+        return max(levels) < self.FLAT_RATIO * max(min(levels), 1e-6)
 
 
 def _live_line(text: str) -> None:
@@ -160,6 +194,8 @@ class DictationSession(threading.Thread):
             mic.start()
         except Exception as exc:
             print(f"\n  mic error: {exc}", file=sys.stderr)
+            if self.hud:
+                self.hud.flash_error("⚠ microphone unavailable — check input device")
             return
         mic_open_ms = (time.perf_counter() - t_press) * 1000
         try:
@@ -219,6 +255,11 @@ class DictationSession(threading.Thread):
                 pending.append(block)
                 pending_len += len(block)
                 if pending_len >= chunk_frames:
+                    # Streaming decode slows as the utterance grows (~1s per
+                    # partial at 30s+); a release that lands mid-loop must not
+                    # wait behind one more partial nobody will see.
+                    if self.stop_event.is_set():
+                        break
                     stream.add_audio(to_mx(np.concatenate(pending)))
                     pending = []
                     pending_len = 0

@@ -20,6 +20,13 @@ AMBIENT = 0.002
 SPEECH = 0.05
 
 
+def speech(n):
+    """n blocks of voiced audio. Real speech RMS swings block to block; a
+    constant level would (correctly) trip the flat-is-machinery check."""
+    cycle = [0.05, 0.12, 0.03, 0.09, 0.06, 0.15]
+    return [cycle[i % len(cycle)] for i in range(n)]
+
+
 def feed(stopper, levels, dt=0.1, t0=0.0):
     """Run a block sequence through the stopper; return the stop time or None."""
     for i, rms in enumerate(levels):
@@ -30,7 +37,7 @@ def feed(stopper, levels, dt=0.1, t0=0.0):
 
 def test_stops_after_silence_follows_speech():
     s = SilenceStopper(stop_after=1.5)
-    levels = [AMBIENT] * 5 + [SPEECH] * 20 + [AMBIENT] * 30
+    levels = [AMBIENT] * 5 + speech(20) + [AMBIENT] * 30
     stopped_at = feed(s, levels)
     assert stopped_at is not None
     # last voiced block is index 24 (t=2.4); stop at >= 2.4 + 1.5
@@ -56,7 +63,43 @@ def test_never_speaking_self_cancels():
 
 def test_no_stop_while_still_talking():
     s = SilenceStopper(stop_after=1.5)
-    assert feed(s, [AMBIENT] * 5 + [SPEECH] * 100) is None
+    assert feed(s, [AMBIENT] * 5 + speech(100)) is None
+    assert s.speech_started
+
+
+def test_band_noise_cannot_postpone_stop_forever():
+    """Noise between half and full threshold (a fan spinning up mid-dictation)
+    used to refresh the hysteresis timer on every block, so the recording never
+    ended. Now hysteresis is bounded and the floor re-anchors: worst case is
+    two stop_after periods after the last clearly-voiced block."""
+    s = SilenceStopper(stop_after=1.5)
+    # thresh anchors at max(0.008, 3*AMBIENT) = 0.008; 0.005 sits in [0.004, 0.008)
+    band_noise = 0.005
+    levels = [AMBIENT] * 5 + speech(20) + [band_noise] * 100
+    stopped_at = feed(s, levels)
+    assert stopped_at is not None
+    last_speech = 2.4
+    assert last_speech + 1.5 <= stopped_at <= last_speech + 2 * 1.5 + 0.2
+
+
+def test_loud_steady_noise_stops():
+    """A level above the speech threshold but flat for a whole stop_after
+    window is machinery, not a voice — it must not hold the mic open."""
+    s = SilenceStopper(stop_after=1.5)
+    levels = [AMBIENT] * 5 + speech(20) + [0.02] * 100
+    stopped_at = feed(s, levels)
+    assert stopped_at is not None
+    last_speech = 2.4
+    assert last_speech + 1.4 <= stopped_at <= last_speech + 2 * 1.5 + 0.2
+
+
+def test_floor_snaps_back_down_after_noise():
+    """After sustained noise lifts the ambient floor, one quiet block restores
+    full sensitivity — a resumed voice is heard as speech again."""
+    s = SilenceStopper(stop_after=1.5)
+    for i, rms in enumerate([AMBIENT] * 5 + [0.006] * 30 + [AMBIENT]):
+        s.update(rms, i * 0.1)
+    assert not s.update(0.009, 3.7)  # 0.009 >= restored thresh: voiced, no stop
     assert s.speech_started
 
 
